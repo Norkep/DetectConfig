@@ -3,12 +3,28 @@
 # Collecte: OS, CPU, GPU/TPU, Mémoire, Stockage, Réseau, IP, Docker/K8s, etc.
 # Sortie JSON
 
-import argparse, json, os, platform, re, shlex, shutil, socket, subprocess, sys, time, getpass
-from typing import Any, Callable, Dict, List, Optional
+import argparse
+import getpass
+import glob
+import json
+import os
+import platform
+import re
+import shlex
+import shutil
+import socket
+import subprocess
+import sys
+import time
+import urllib.request
+from collections import Counter, OrderedDict
 from datetime import datetime, timezone
 from functools import wraps
+from statistics import mode
+from typing import Any, Dict, List, Optional
 
 psutil = None
+TRUTHY_ENV_VALUES = {"1", "true", "yes", "on"}
 
 # ======================== UTILITAIRES ========================
 def safe(default=None):
@@ -16,8 +32,10 @@ def safe(default=None):
     def decorator(fn):
         @wraps(fn)
         def wrapper(*args, **kwargs):
-            try: return fn(*args, **kwargs)
-            except: return default() if callable(default) else default
+            try:
+                return fn(*args, **kwargs)
+            except Exception:
+                return default() if callable(default) else default
         return wrapper
     return decorator
 
@@ -26,14 +44,19 @@ def _ensure_psutil(allow_install: bool = False) -> Any:
     try:
         import psutil as ps
         return ps
-    except: pass
-    if not (allow_install or os.environ.get("DETECTOS_AUTO_INSTALL") in ("1", "true", "yes", "on")):
+    except Exception:
+        pass
+
+    auto_install = os.environ.get("DETECTOS_AUTO_INSTALL") in TRUTHY_ENV_VALUES
+    if not (allow_install or auto_install):
         return None
+
     try:
         subprocess.run([sys.executable, "-m", "pip", "install", "--quiet", "psutil"], check=False)
         import psutil as ps
         return ps
-    except: return None
+    except Exception:
+        return None
 
 def _to_gib(n: Optional[float]) -> Optional[float]:
     return round(float(n) / (1024 ** 3), 2) if n is not None else None
@@ -42,21 +65,31 @@ def _to_gb(n: Optional[float]) -> Optional[float]:
     return round(float(n) / (1000 ** 3), 2) if n is not None else None
 
 def _try_float(x: Optional[str]) -> Optional[float]:
-    try: return float(str(x).strip()) if x else None
-    except: return None
+    try:
+        return float(str(x).strip()) if x else None
+    except Exception:
+        return None
 
 def run_cmd(cmd: str, timeout: float = 2.5, shell_mode: bool = False) -> Dict[str, Any]:
     """Exécute une commande et retourne un dict structuré."""
     start = time.time()
     try:
+        command = cmd if shell_mode else shlex.split(cmd)
         proc = subprocess.run(
-            cmd if shell_mode else shlex.split(cmd),
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            timeout=timeout, text=True, shell=shell_mode
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout,
+            text=True,
+            shell=shell_mode,
         )
-        return {"ok": proc.returncode == 0, "code": proc.returncode,
-                "stdout": proc.stdout.strip(), "stderr": proc.stderr.strip(),
-                "duration_s": round(time.time() - start, 3)}
+        return {
+            "ok": proc.returncode == 0,
+            "code": proc.returncode,
+            "stdout": proc.stdout.strip(),
+            "stderr": proc.stderr.strip(),
+            "duration_s": round(time.time() - start, 3),
+        }
     except FileNotFoundError:
         return {"ok": False, "error": "not_found", "duration_s": round(time.time() - start, 3)}
     except subprocess.TimeoutExpired:
@@ -67,15 +100,17 @@ def run_cmd(cmd: str, timeout: float = 2.5, shell_mode: bool = False) -> Dict[st
 def http_get(url: str, headers: Optional[Dict[str, str]] = None, timeout: float = 0.5) -> Optional[str]:
     """Requête HTTP GET rapide."""
     try:
-        import urllib.request
         req = urllib.request.Request(url, headers=headers or {})
         with urllib.request.urlopen(req, timeout=timeout) as r:
             return r.read(1024).decode("utf-8", "ignore")
-    except: return None
+    except Exception:
+        return None
 
 def _get_version(cmd: str) -> Optional[str]:
     """Obtient la version d'un outil via commande."""
-    if shutil.which(cmd.split()[0]) is None: return None
+    if shutil.which(cmd.split()[0]) is None:
+        return None
+
     r = run_cmd(cmd)
     out = (r.get("stdout") or r.get("stderr") or "").strip()
     return out.splitlines()[0] if out else None
@@ -147,7 +182,6 @@ def detect_cpu_advanced() -> Dict[str, Any]:
 
     # Instructions SIMD (pour ML/vectorisation)
     try:
-        import subprocess
         if SYS == "Linux":
             # Vérifier flags CPU
             r = run_cmd("grep -m1 'flags' /proc/cpuinfo", timeout=1.0)
@@ -174,7 +208,8 @@ def detect_cpu_advanced() -> Dict[str, Any]:
     # NUMA (pour gros serveurs)
     if SYS == "Linux" and shutil.which("numactl"):
         r = run_cmd("numactl --hardware", timeout=2.0)
-        if r.get("ok"): info["numa_raw"] = r.get("stdout")
+        if r.get("ok"):
+            info["numa_raw"] = r.get("stdout")
 
     return info
 
@@ -187,7 +222,6 @@ def detect_storage_performance() -> Dict[str, Any]:
     test_file = "/tmp/detectConfig_io_test.tmp"
     try:
         # Test écriture/lecture rapide
-        import time
         test_data = b"0" * (1024 * 1024)  # 1MB
 
         # Test écriture
@@ -201,7 +235,7 @@ def detect_storage_performance() -> Dict[str, Any]:
         # Test lecture
         start = time.time()
         with open(test_file, "rb") as f:
-            data = f.read()
+            f.read()
         read_time = time.time() - start
         read_mb_s = 10 / read_time
 
@@ -259,7 +293,8 @@ def detect_accelerators() -> Dict[str, Any]:
     if shutil.which("rocm-smi"):
         try:
             r = run_cmd("rocm-smi --showid --showproductname --showuniqueid", timeout=3.0)
-            if r.get("ok"): info["amd_rocm_details"] = r.get("stdout")
+            if r.get("ok"):
+                info["amd_rocm_details"] = r.get("stdout")
         except: pass
 
     # Apple Silicon (macOS)
@@ -267,7 +302,6 @@ def detect_accelerators() -> Dict[str, Any]:
         try:
             r = run_cmd("system_profiler SPDisplaysDataType -json", timeout=3.0)
             if r.get("ok") and r.get("stdout"):
-                import json
                 try:
                     data = json.loads(r["stdout"])
                     gpu_info = data.get("SPDisplaysDataType", [{}])[0] if data.get("SPDisplaysDataType") else {}
@@ -284,9 +318,16 @@ def detect_accelerators() -> Dict[str, Any]:
 
         # Try to detect TPU type via JAX
         try:
-            import subprocess
-            r = subprocess.run([sys.executable, "-c",
-                "try:\n import jax; ds=jax.devices(); print([str(d) for d in ds if 'tpu' in str(d).lower()])\nexcept: print([])"], capture_output=True, text=True, timeout=5)
+            r = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    "try:\n import jax; ds=jax.devices(); print([str(d) for d in ds if 'tpu' in str(d).lower()])\nexcept: print([])",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
             if r.returncode == 0 and r.stdout.strip():
                 info["tpu_devices"] = r.stdout.strip()
         except: pass
@@ -372,7 +413,6 @@ def detect_user_permissions() -> Dict[str, Any]:
     # Permissions réseau
     network_perms = {"internet_access": False, "https_access": False}
     try:
-        import urllib.request
         with urllib.request.urlopen("https://www.google.com", timeout=3.0) as response:
             network_perms["internet_access"] = True
             network_perms["https_access"] = True
@@ -700,11 +740,12 @@ def detect_runtime_env() -> Dict[str, Any]:
     try:
         with open("/proc/1/cgroup", "r", encoding="utf-8", errors="ignore") as f:
             cg = f.read()
-            if any(x in cg for x in ["docker", "containerd", "kubepods"]): in_docker = True
+            if any(x in cg for x in ["docker", "containerd", "kubepods"]):
+                in_docker = True
     except: pass
-    
+
     # Cloud provider detection
-    provider, detail = None, {}
+    provider = None
     if http_get("http://169.254.169.254/latest/meta-data/ami-id"):
         provider = "aws"
     elif http_get("http://169.254.169.254/metadata/instance?api-version=2021-02-01", {"Metadata": "true"}):
@@ -713,31 +754,45 @@ def detect_runtime_env() -> Dict[str, Any]:
         provider = "gcp"
     elif http_get("http://169.254.169.254/opc/v2/instance/", {"Authorization": "Bearer Oracle"}):
         provider = "oci"
-    
+
     # Machine type
-    if in_colab: mt = "Google Colab"
-    elif provider: mt = f"Cloud VM ({provider})"
-    elif in_k8s: mt = "Kubernetes Pod"
-    elif in_docker: mt = "Docker Container"
-    elif SYS == "Darwin": mt = "Mac"
-    elif SYS == "Windows": mt = "PC (Windows)"
-    elif SYS == "Linux": mt = "Linux"
-    else: mt = SYS or "Unknown"
-    
+    if in_colab:
+        mt = "Google Colab"
+    elif provider:
+        mt = f"Cloud VM ({provider})"
+    elif in_k8s:
+        mt = "Kubernetes Pod"
+    elif in_docker:
+        mt = "Docker Container"
+    elif SYS == "Darwin":
+        mt = "Mac"
+    elif SYS == "Windows":
+        mt = "PC (Windows)"
+    elif SYS == "Linux":
+        mt = "Linux"
+    else:
+        mt = SYS or None
+
     # Remote detection
     reasons = []
-    if env.get("SSH_CONNECTION") or env.get("SSH_TTY"): reasons.append("ssh_session")
-    if provider: reasons.append(f"cloud:{provider}")
-    if in_k8s: reasons.append("kubernetes_pod")
-    if in_docker: reasons.append("docker_container")
-    if env.get("CI"): reasons.append("ci_env")
-    if env.get("VSCODE_IPC_HOOK"): reasons.append("vscode_remote_hint")
+    if env.get("SSH_CONNECTION") or env.get("SSH_TTY"):
+        reasons.append("ssh_session")
+    if provider:
+        reasons.append(f"cloud:{provider}")
+    if in_k8s:
+        reasons.append("kubernetes_pod")
+    if in_docker:
+        reasons.append("docker_container")
+    if env.get("CI"):
+        reasons.append("ci_env")
+    if env.get("VSCODE_IPC_HOOK"):
+        reasons.append("vscode_remote_hint")
     
     return {
         "machine_type": mt, "colab": in_colab, "docker": in_docker,
         "docker_desktop_hint": bool(env.get("DOCKER_DESKTOP") or env.get("WSL_INTEROP")),
         "kubernetes": in_k8s, "cloud_provider": provider,
-        "cloud_detail": detail or None, "is_remote": len(reasons) > 0,
+        "cloud_detail": None, "is_remote": len(reasons) > 0,
         "remote_reasons": reasons or None
     }
 
@@ -986,11 +1041,11 @@ def detect_memory_hardware() -> Dict[str, Any]:
             for line in r["stdout"].splitlines():
                 m = re.search(r"(?:Configured Memory |)Speed:\s*(\d+)\s*MT/s", line)
                 if m:
-                    try: speeds.append(int(m.group(1)))
+                    try:
+                        speeds.append(int(m.group(1)))
                     except: pass
             if speeds:
                 hw["modules"] = [{"speed_mt_s": s, "speed_mhz_approx": s} for s in speeds]
-                from collections import Counter
                 hw["speed_mhz_nominal"] = Counter(speeds).most_common(1)[0][0]
     
     elif SYS == "Darwin" and shutil.which("system_profiler"):
@@ -1003,20 +1058,23 @@ def detect_memory_hardware() -> Dict[str, Any]:
                         for v in obj.values():
                             if isinstance(v, str):
                                 m = re.search(r"\b(\d+)\s*MHz\b", v)
-                                if m: speeds.append(int(m.group(1)))
+                                if m:
+                                    speeds.append(int(m.group(1)))
                             elif isinstance(v, (dict, list)):
                                 speeds.extend(extract_speeds(v))
                     elif isinstance(obj, list):
-                        for item in obj: speeds.extend(extract_speeds(item))
+                        for item in obj:
+                            speeds.extend(extract_speeds(item))
                     return speeds
                 
                 data = json.loads(r["stdout"])
                 speeds = extract_speeds(data)
                 if speeds:
                     hw["modules"] = [{"speed_mhz": s} for s in speeds]
-                    from statistics import mode
-                    try: hw["speed_mhz_nominal"] = mode(speeds)
-                    except: hw["speed_mhz_nominal"] = max(speeds)
+                    try:
+                        hw["speed_mhz_nominal"] = mode(speeds)
+                    except:
+                        hw["speed_mhz_nominal"] = max(speeds)
             except: pass
     
     elif SYS == "Windows" and shutil.which("wmic"):
@@ -1030,7 +1088,6 @@ def detect_memory_hardware() -> Dict[str, Any]:
                             speeds.append(int(v.strip()))
             if speeds:
                 hw["modules"] = [{"speed_mhz": s} for s in speeds]
-                from collections import Counter
                 hw["speed_mhz_nominal"] = Counter(speeds).most_common(1)[0][0]
     
     return hw
@@ -1044,25 +1101,34 @@ def detect_hardware() -> Dict[str, Any]:
     if SYS == "Linux" and shutil.which("dmidecode"):
         r = run_cmd("dmidecode -t 0 -t 1 -t 2 -t 3 -t 17", timeout=6.0)
         if r.get("ok") and r.get("stdout"):
-            bios, sysinfo, baseboard = {}, {}, {}
+            bios, sysinfo = {}, {}
             manuf_dates = []
             for line in r["stdout"].splitlines():
                 s = line.strip()
-                if s.startswith("Vendor:") and not bios.get("vendor"): bios["vendor"] = s.split(":", 1)[1].strip()
-                elif s.startswith("Version:") and not bios.get("version"): bios["version"] = s.split(":", 1)[1].strip()
-                elif s.startswith("Release Date:"): 
+                if s.startswith("Vendor:") and not bios.get("vendor"):
+                    bios["vendor"] = s.split(":", 1)[1].strip()
+                elif s.startswith("Version:") and not bios.get("version"):
+                    bios["version"] = s.split(":", 1)[1].strip()
+                elif s.startswith("Release Date:"):
                     bios["release_date"] = s.split(":", 1)[1].strip()
                     manuf_dates.append(bios["release_date"])
-                elif s.startswith("Manufacturer:") and not sysinfo.get("manufacturer"): sysinfo["manufacturer"] = s.split(":", 1)[1].strip()
-                elif s.startswith("Product Name:") and not sysinfo.get("product"): sysinfo["product"] = s.split(":", 1)[1].strip()
-                elif s.startswith("Serial Number:") and not sysinfo.get("serial"): sysinfo["serial"] = s.split(":", 1)[1].strip()
-            if bios: info["bios"] = bios
-            if sysinfo: info["system"] = sysinfo
-            if manuf_dates: info["manufacture_dates"] = sorted(set(manuf_dates))
+                elif s.startswith("Manufacturer:") and not sysinfo.get("manufacturer"):
+                    sysinfo["manufacturer"] = s.split(":", 1)[1].strip()
+                elif s.startswith("Product Name:") and not sysinfo.get("product"):
+                    sysinfo["product"] = s.split(":", 1)[1].strip()
+                elif s.startswith("Serial Number:") and not sysinfo.get("serial"):
+                    sysinfo["serial"] = s.split(":", 1)[1].strip()
+            if bios:
+                info["bios"] = bios
+            if sysinfo:
+                info["system"] = sysinfo
+            if manuf_dates:
+                info["manufacture_dates"] = sorted(set(manuf_dates))
     
     elif SYS == "Darwin" and shutil.which("system_profiler"):
         r = run_cmd("system_profiler SPHardwareDataType -json", timeout=5.0)
-        if r.get("ok"): info["hardware_overview"] = r.get("stdout")
+        if r.get("ok"):
+            info["hardware_overview"] = r.get("stdout")
     
     elif SYS == "Windows":
         # BIOS
@@ -1076,8 +1142,10 @@ def detect_hardware() -> Dict[str, Any]:
                     if k == "releasedate" and v:
                         m = re.match(r"(\d{4})(\d{2})(\d{2})", v)
                         bios["release_date"] = f"{m.group(1)}-{m.group(2)}-{m.group(3)}" if m else v
-                    elif k == "smbiosbiosversion": bios["version"] = v
-            if bios: info["bios"] = bios
+                    elif k == "smbiosbiosversion":
+                        bios["version"] = v
+            if bios:
+                info["bios"] = bios
         
         # Windows license
         lic = run_cmd("wmic path SoftwareLicensingProduct where (Name like 'Windows%%' and PartialProductKey is not null) get Description,PartialProductKey,LicenseStatus /value", timeout=6.0)
@@ -1089,13 +1157,18 @@ def detect_hardware() -> Dict[str, Any]:
                     if "=" in line:
                         k, v = line.split("=", 1)
                         k, v = k.strip().lower(), v.strip()
-                        if k == "partialproductkey": rec["partial_key_last5"] = v
-                        elif k == "licensestatus": rec["license_status"] = v
+                        if k == "partialproductkey":
+                            rec["partial_key_last5"] = v
+                        elif k == "licensestatus":
+                            rec["license_status"] = v
                         elif k == "description":
                             rec["description"] = v
                             for pat, ch in [("OEM", "OEM"), ("VOLUME|MAK|KMS", "VOLUME"), ("RETAIL", "RETAIL")]:
-                                if re.search(pat, v, re.I): rec["channel"] = ch; break
-                if rec: info["windows_license"] = rec
+                                if re.search(pat, v, re.I):
+                                    rec["channel"] = ch
+                                    break
+                if rec:
+                    info["windows_license"] = rec
     
     # Physical disks
     disks = []
@@ -1195,10 +1268,14 @@ def detect_network() -> Dict[str, Any]:
                 net["interfaces"][name] = []
                 for a in addr_list:
                     try:
-                        if hasattr(socket, "AF_LINK") and a.family == socket.AF_LINK: family = "mac"
-                        elif a.family == socket.AF_INET: family = "ipv4"
-                        elif a.family == socket.AF_INET6: family = "ipv6"
-                        else: family = str(a.family)
+                        if hasattr(socket, "AF_LINK") and a.family == socket.AF_LINK:
+                            family = "mac"
+                        elif a.family == socket.AF_INET:
+                            family = "ipv4"
+                        elif a.family == socket.AF_INET6:
+                            family = "ipv6"
+                        else:
+                            family = str(a.family)
                         net["interfaces"][name].append({
                             "family": family, "address": a.address,
                             "netmask": a.netmask, "broadcast": getattr(a, "broadcast", None)
@@ -1211,21 +1288,24 @@ def detect_network() -> Dict[str, Any]:
         net["hostname"] = hostname
         net["fqdn"] = socket.getfqdn()
         net["loopback"] = "127.0.0.1"
-        try: net["primary_ipv4"] = socket.gethostbyname(hostname)
-        except: net["primary_ipv4"] = None
+        try:
+            net["primary_ipv4"] = socket.gethostbyname(hostname)
+        except:
+            net["primary_ipv4"] = None
     except: pass
     
     if not psutil:
         if SYS == "Linux":
             r = run_cmd("hostname -I")
-            if r.get("ok"): net["private_ipv4"] = [i for i in r["stdout"].split() if i != "127.0.0.1"]
+            if r.get("ok"):
+                net["private_ipv4"] = [i for i in r["stdout"].split() if i != "127.0.0.1"]
         elif SYS == "Darwin":
             for iface in ("en0", "en1"):
                 r = run_cmd(f"ipconfig getifaddr {iface}")
-                if r.get("ok"): net.setdefault("private_ipv4", []).append(r["stdout"].strip())
-    
+                if r.get("ok"):
+                    net.setdefault("private_ipv4", []).append(r["stdout"].strip())
+
     # Public IP
-    import urllib.request
     for url in ["https://api.ipify.org", "https://ifconfig.me/ip", "https://ipinfo.io/ip"]:
         try:
             with urllib.request.urlopen(url, timeout=1.5) as r:
@@ -1244,32 +1324,43 @@ def detect_network() -> Dict[str, Any]:
                 cur_port = None
                 for line in r["stdout"].splitlines():
                     line = line.strip()
-                    if line.startswith("Hardware Port:"): cur_port = line.split(":", 1)[1].strip()
+                    if line.startswith("Hardware Port:"):
+                        cur_port = line.split(":", 1)[1].strip()
                     elif line.startswith("Device:"):
                         dev = line.split(":", 1)[1].strip()
-                        if cur_port: hwport_by_dev[dev] = cur_port
-        
-        def classify_interface(name, addrs):
-            role, desc = "unknown", "Interface réseau"
+                        if cur_port:
+                            hwport_by_dev[dev] = cur_port
+
+        def classify_interface(name):
+            role, desc = None, None
             if SYS == "Darwin":
-                if name in ("lo", "lo0"): return "loopback", "Boucle locale"
-                if name.startswith("utun"): return "vpn_tunnel", "Tunnel/VPN"
+                if name in ("lo", "lo0"):
+                    return "loopback", "Boucle locale"
+                if name.startswith("utun"):
+                    return "vpn_tunnel", "Tunnel/VPN"
                 if name.startswith("en"):
                     hp = hwport_by_dev.get(name)
                     if hp:
-                        if re.search(r"wi-?fi", hp, re.I): return "wifi", f"Wi-Fi ({hp})"
-                        if re.search(r"ethernet|thunderbolt", hp, re.I): return "ethernet", f"Ethernet ({hp})"
+                        if re.search(r"wi-?fi", hp, re.I):
+                            return "wifi", f"Wi-Fi ({hp})"
+                        if re.search(r"ethernet|thunderbolt", hp, re.I):
+                            return "ethernet", f"Ethernet ({hp})"
             elif SYS == "Linux":
-                if name in ("lo", "lo0"): return "loopback", "Boucle locale"
-                if re.match(r"^(eth|eno|enp|ens)", name): return "ethernet", "Interface Ethernet"
-                if re.match(r"^(wlan|wlp)", name): return "wifi", "Interface Wi-Fi"
-                if name.startswith("docker"): return "bridge", "Pont Docker"
+                if name in ("lo", "lo0"):
+                    return "loopback", "Boucle locale"
+                if re.match(r"^(eth|eno|enp|ens)", name):
+                    return "ethernet", "Interface Ethernet"
+                if re.match(r"^(wlan|wlp)", name):
+                    return "wifi", "Interface Wi-Fi"
+                if name.startswith("docker"):
+                    return "bridge", "Pont Docker"
             return role, desc
-        
-        net["interfaces_info"] = {
-            name: {"role": classify_interface(name, items)[0], "description": classify_interface(name, items)[1]}
-            for name, items in net.get("interfaces", {}).items()
-        }
+
+        interfaces_info = {}
+        for name in net.get("interfaces", {}):
+            role, description = classify_interface(name)
+            interfaces_info[name] = {"role": role, "description": description}
+        net["interfaces_info"] = interfaces_info
     except: pass
 
     # Réseaux Wi-Fi à portée (meilleur effort, dépend des droits)
@@ -1540,7 +1631,7 @@ def detect_remote_access() -> Dict[str, Any]:
                     "local_ip": local_ip,
                     "access_type": access_type,
                     "pid": conn.pid,
-                    "service": remote_access_ports.get(port, "Unknown")
+                    "service": remote_access_ports.get(port)
                 }
 
                 # Obtenir info processus
@@ -1589,9 +1680,9 @@ def detect_remote_access() -> Dict[str, Any]:
                         session = {
                             "username": parts[0],
                             "terminal": parts[1],
-                            "login_time": " ".join(parts[2:4]) if len(parts) >= 4 else "unknown",
-                            "idle": parts[4] if len(parts) > 4 else ".",
-                            "from": parts[5] if len(parts) > 5 else "local"
+                            "login_time": " ".join(parts[2:4]) if len(parts) >= 4 else None,
+                            "idle": parts[4] if len(parts) > 4 else None,
+                            "from": parts[5] if len(parts) > 5 else None
                         }
 
                         # Déterminer si remote ou local
@@ -1618,10 +1709,10 @@ def detect_remote_access() -> Dict[str, Any]:
                             # Extraire IP et port
                             if ":" in remote_addr:
                                 remote_ip = remote_addr.rsplit(":", 1)[0]
-                                remote_port = remote_addr.rsplit(":", 1)[1] if ":" in remote_addr else "unknown"
+                                remote_port = remote_addr.rsplit(":", 1)[1] if ":" in remote_addr else None
                             else:
                                 remote_ip = remote_addr
-                                remote_port = "unknown"
+                                remote_port = None
 
                             remote_sessions.append({
                                 "type": "ssh_connection",
@@ -1733,8 +1824,8 @@ def detect_servers_and_passwords() -> Dict[str, Any]:
                     # Détecter les serveurs MCP
                     if 'mcp' in cmdline_str.lower():
                         # Extraire le nom du serveur MCP de la ligne de commande
-                        server_name = "unknown"
-                        folder_path = proc.info.get('cwd', 'unknown')
+                        server_name = None
+                        folder_path = proc.info.get('cwd')
 
                         # Parser la commande pour trouver le nom
                         if '--name' in cmdline_str:
@@ -1798,7 +1889,7 @@ def detect_servers_and_passwords() -> Dict[str, Any]:
                             for server_name, server_config in config_data["mcpServers"].items():
                                 mcp_installed_servers.append({
                                     "name": server_name,
-                                    "command": server_config.get("command", "unknown"),
+                                    "command": server_config.get("command"),
                                     "args": server_config.get("args", []),
                                     "env": server_config.get("env", {}),
                                     "config_file": fpath,
@@ -1810,10 +1901,10 @@ def detect_servers_and_passwords() -> Dict[str, Any]:
                             if isinstance(config_data["servers"], list):
                                 for server in config_data["servers"]:
                                     mcp_installed_servers.append({
-                                        "name": server.get("name", "unknown"),
-                                        "command": server.get("command", "unknown"),
+                                        "name": server.get("name"),
+                                        "command": server.get("command"),
                                         "args": server.get("args", []),
-                                        "folder_path": server.get("path", "unknown"),
+                                        "folder_path": server.get("path"),
                                         "config_file": fpath,
                                         "type": "generic"
                                     })
@@ -1821,7 +1912,7 @@ def detect_servers_and_passwords() -> Dict[str, Any]:
                                 for server_name, server_config in config_data["servers"].items():
                                     mcp_installed_servers.append({
                                         "name": server_name,
-                                        "command": server_config.get("command", "unknown"),
+                                        "command": server_config.get("command"),
                                         "args": server_config.get("args", []),
                                         "config_file": fpath,
                                         "type": "generic"
@@ -1843,7 +1934,7 @@ def detect_servers_and_passwords() -> Dict[str, Any]:
                     if "mcp" in pkg_name.lower():
                         npm_mcp_servers.append({
                             "name": pkg_name,
-                            "version": deps[pkg_name].get("version", "unknown"),
+                            "version": deps[pkg_name].get("version"),
                             "install_type": "npm_global"
                         })
             except:
@@ -2082,7 +2173,6 @@ def detect_servers_and_passwords() -> Dict[str, Any]:
 
     # AWS EC2 Metadata
     try:
-        import urllib.request
         req = urllib.request.Request(
             "http://169.254.169.254/latest/meta-data/instance-id",
             headers={'User-Agent': 'detectConfig'}
@@ -2119,7 +2209,6 @@ def detect_servers_and_passwords() -> Dict[str, Any]:
 
     # Google Cloud Metadata
     try:
-        import urllib.request
         req = urllib.request.Request(
             "http://metadata.google.internal/computeMetadata/v1/instance/id",
             headers={'Metadata-Flavor': 'Google', 'User-Agent': 'detectConfig'}
@@ -2135,7 +2224,6 @@ def detect_servers_and_passwords() -> Dict[str, Any]:
 
     # Azure Metadata
     try:
-        import urllib.request
         req = urllib.request.Request(
             "http://169.254.169.254/metadata/instance?api-version=2021-02-01",
             headers={'Metadata': 'true', 'User-Agent': 'detectConfig'}
@@ -2348,7 +2436,6 @@ def detect_exposed_credentials() -> Dict[str, Any]:
         for path_pattern in paths:
             # Gérer les wildcards
             if "*" in path_pattern:
-                import glob
                 matching_paths = glob.glob(path_pattern)
             else:
                 matching_paths = [path_pattern] if os.path.exists(path_pattern) else []
@@ -2609,6 +2696,102 @@ def detect_ai_llm_metrics() -> Dict[str, Any]:
     }
 
     return info
+
+@safe(dict)
+def detect_editor_ai_keys() -> Dict[str, Any]:
+    """Détecte les variables et fichiers de configuration IA réellement présents."""
+    home = os.path.expanduser("~")
+    appdata = os.environ.get("APPDATA")
+
+    env_patterns = [
+        "ANTHROPIC", "CLAUDE", "OPENAI", "GEMINI", "GOOGLE_API_KEY",
+        "MISTRAL", "GROQ", "OPENROUTER", "TOGETHER", "PERPLEXITY",
+        "COHERE", "DEEPSEEK", "OLLAMA", "LMSTUDIO", "CODEIUM",
+        "CURSOR", "WINDSURF", "CONTINUE",
+    ]
+    excluded_patterns = ["CODESIGN_MCP_TOKEN", "SESSION_ID", "OAUTH_TOKEN"]
+
+    environment_vars = []
+    for key, value in os.environ.items():
+        key_upper = key.upper()
+        if any(pattern in key_upper for pattern in excluded_patterns):
+            continue
+        if any(pattern in key_upper for pattern in env_patterns):
+            environment_vars.append({
+                "variable": key,
+                "value": value,
+                "length": len(value) if value else 0,
+            })
+
+    config_candidates = [
+        os.path.join(home, ".claude.json"),
+        os.path.join(home, ".claude/settings.json"),
+        os.path.join(home, ".codex/config.toml"),
+        os.path.join(home, ".continue/config.json"),
+        os.path.join(home, ".continue/config.yaml"),
+        os.path.join(home, ".continue/config.yml"),
+        os.path.join(home, ".cursor/mcp.json"),
+        os.path.join(home, ".cursor/settings.json"),
+        os.path.join(home, ".config/Code/User/settings.json"),
+        os.path.join(home, ".config/Cursor/User/settings.json"),
+        os.path.join(home, ".config/Windsurf/User/settings.json"),
+        os.path.join(home, "Library/Application Support/Claude/claude_desktop_config.json"),
+        os.path.join(home, "Library/Application Support/Code/User/settings.json"),
+        os.path.join(home, "Library/Application Support/Cursor/User/settings.json"),
+        os.path.join(home, "Library/Application Support/Windsurf/User/settings.json"),
+    ]
+    if appdata:
+        config_candidates.extend([
+            os.path.join(appdata, "Claude/claude_desktop_config.json"),
+            os.path.join(appdata, "Code/User/settings.json"),
+            os.path.join(appdata, "Cursor/User/settings.json"),
+            os.path.join(appdata, "Windsurf/User/settings.json"),
+        ])
+
+    secret_patterns = {
+        "api_key": r"\b(api[_-]?key|apikey)\b",
+        "token": r"\btoken\b",
+        "anthropic": r"\banthropic\b",
+        "openai": r"\bopenai\b",
+        "gemini": r"\bgemini\b",
+        "mcp": r"\bmcp\b",
+        "ollama": r"\bollama\b",
+    }
+
+    config_files = []
+    for path in dict.fromkeys(config_candidates):
+        if not os.path.isfile(path):
+            continue
+        try:
+            stat_info = os.stat(path)
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                preview = f.read(5000)
+            patterns_detected = [
+                name
+                for name, pattern in secret_patterns.items()
+                if re.search(pattern, preview, re.IGNORECASE)
+            ]
+            config_files.append({
+                "path": path,
+                "size_bytes": stat_info.st_size,
+                "permissions": oct(stat_info.st_mode)[-3:],
+                "patterns_detected": patterns_detected,
+            })
+        except Exception as e:
+            config_files.append({
+                "path": path,
+                "error": str(e),
+            })
+
+    return {
+        "environment_vars": sorted(environment_vars, key=lambda item: item["variable"]),
+        "config_files": config_files,
+        "summary": {
+            "environment_vars_count": len(environment_vars),
+            "config_files_count": len(config_files),
+            "config_files_with_patterns": sum(1 for item in config_files if item.get("patterns_detected")),
+        },
+    }
 
 # ======================== PERIPHERIQUES ========================
 @safe(dict)
@@ -3526,8 +3709,8 @@ def detect_dns() -> Dict[str, Any]:
         else:
             dns_providers.append({
                 "ip": ns,
-                "provider": "Unknown/ISP",
-                "type": "unknown"
+                "provider": None,
+                "type": None
             })
 
     info["dns_providers"] = dns_providers
@@ -3573,7 +3756,6 @@ def detect_dns() -> Dict[str, Any]:
     # Firefox DoH
     if SYS == "Linux":
         firefox_prefs = os.path.expanduser("~/.mozilla/firefox/*.default*/prefs.js")
-        import glob
         for prefs_file in glob.glob(firefox_prefs):
             try:
                 with open(prefs_file, 'r', encoding='utf-8', errors='ignore') as f:
@@ -3645,8 +3827,10 @@ def detect_internet() -> Dict[str, Any]:
     # TCP tests
     def tcp_ok(host, port, timeout_s=1.2):
         try:
-            with socket.create_connection((host, port), timeout=timeout_s): return True
-        except: return False
+            with socket.create_connection((host, port), timeout=timeout_s):
+                return True
+        except:
+            return False
     
     result["tcp"] = {
         "1.1.1.1:53": tcp_ok("1.1.1.1", 53),
@@ -3656,7 +3840,6 @@ def detect_internet() -> Dict[str, Any]:
     
     # HTTP probes
     http_checks = {}
-    import urllib.request
     for url in ["http://example.com", "https://www.google.com"]:
         try:
             start = time.time()
@@ -3751,9 +3934,8 @@ def detect_speedtest() -> Dict[str, Any]:
         except: pass
     out["private_ipv4"] = sorted(set(priv_v4)) or None
     out["private_ipv6"] = sorted(set(priv_v6)) or None
-    
+
     # Public IPs
-    import urllib.request
     try:
         with urllib.request.urlopen("https://api.ipify.org", timeout=2.0) as r:
             v = r.read(64).decode("utf-8", "ignore").strip()
@@ -3995,8 +4177,6 @@ def format_readable_output(data: Dict[str, Any]) -> str:
 
 def build_human_view(data: Dict[str, Any]) -> Dict[str, Any]:
     """Réorganise les sections en vue synthétique"""
-    from collections import OrderedDict
-
     o = OrderedDict()
 
     # 1) Système & contexte
